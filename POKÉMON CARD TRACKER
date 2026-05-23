@@ -1,0 +1,801 @@
+/****************************************************
+ * BUNEARY + LOPUNNY POKÉMON CARD TRACKER
+ * Google Sheets + Pokémon TCG API
+ *
+ * From-scratch setup:
+ * 1. Paste into Extensions → Apps Script
+ * 2. Save
+ * 3. Run SETUP_BUNEARY_LOPUNNY_TRACKER
+ * 4. Authorise
+ ****************************************************/
+
+const PTCG_BASE_URL = "https://api.pokemontcg.io/v2";
+
+const SHEET_NAMES = {
+  SETTINGS: "Settings",
+  MASTER: "Master Tracker",
+  DASHBOARD: "Dashboard",
+  README: "Read Me"
+};
+
+const MASTER_HEADERS = [
+  "Species",
+  "Pokédex No.",
+  "Card ID",
+  "Card Name",
+  "Set ID",
+  "Set Name",
+  "Series",
+  "Release Date",
+  "Card No.",
+  "Rarity",
+  "Variant",
+  "Price Metric",
+  "Market Price USD",
+  "USD/AUD FX",
+  "Market Price AUD",
+  "Owned?",
+  "Qty Owned",
+  "Condition",
+  "Purchase Price AUD",
+  "Total Cost AUD",
+  "Market Value AUD",
+  "Gain/Loss AUD",
+  "Last Price Updated",
+  "TCGplayer Link",
+  "Image Link",
+  "Serebii Checked?",
+  "Wishlist Priority",
+  "Binder Location",
+  "Notes"
+];
+
+const PRICE_VARIANT_ORDER = [
+  "normal",
+  "holofoil",
+  "reverseHolofoil",
+  "1stEditionNormal",
+  "1stEditionHolofoil"
+];
+
+const PRICE_METRICS = [
+  "market",
+  "low",
+  "mid",
+  "high",
+  "directLow",
+  "manual"
+];
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Pokémon Tracker")
+    .addItem("1) Initial setup / re-import Buneary + Lopunny", "SETUP_BUNEARY_LOPUNNY_TRACKER")
+    .addItem("2) Refresh prices now", "REFRESH_PRICES")
+    .addItem("3) Clear API cache", "CLEAR_PTCG_CACHE")
+    .addToUi();
+}
+
+/**
+ * Main setup function.
+ * Run this once after pasting the script.
+ */
+function SETUP_BUNEARY_LOPUNNY_TRACKER() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const settings = resetSheet_(ss, SHEET_NAMES.SETTINGS);
+  const master = resetSheet_(ss, SHEET_NAMES.MASTER);
+  const dashboard = resetSheet_(ss, SHEET_NAMES.DASHBOARD);
+  const readme = resetSheet_(ss, SHEET_NAMES.README);
+
+  buildSettings_(settings);
+  buildMaster_(master);
+  buildDashboard_(dashboard);
+  buildReadMe_(readme);
+
+  importBunearyLopunny_(master);
+  applyMasterFormatting_(master);
+  applyMasterValidations_(master);
+
+  settings.getRange("B5").setValue(new Date());
+  settings.getRange("B6").setValue(new Date());
+
+  SpreadsheetApp.getUi().alert("Setup complete. Your Buneary + Lopunny tracker is ready.");
+}
+
+/**
+ * Imports all Buneary + Lopunny cards from the Pokémon TCG API.
+ */
+function importBunearyLopunny_(master) {
+  const cardsById = new Map();
+
+  const bunearyCards = fetchCardsByPokedex_(427);
+  const lopunnyCards = fetchCardsByPokedex_(428);
+
+  bunearyCards.concat(lopunnyCards).forEach(card => {
+    if (card && card.id) {
+      cardsById.set(card.id, card);
+    }
+  });
+
+  const cards = Array.from(cardsById.values()).sort((a, b) => {
+    const dateA = ((a.set || {}).releaseDate || "");
+    const dateB = ((b.set || {}).releaseDate || "");
+    const setCompare = dateA.localeCompare(dateB);
+    if (setCompare !== 0) return setCompare;
+
+    const numA = Number(a.number) || 9999;
+    const numB = Number(b.number) || 9999;
+    return numA - numB;
+  });
+
+  const rows = [];
+
+  cards.forEach(card => {
+    const dexNums = card.nationalPokedexNumbers || [];
+    const hasBuneary = dexNums.includes(427);
+    const hasLopunny = dexNums.includes(428);
+
+    let species = "";
+    let pokedexNo = "";
+
+    if (hasBuneary && hasLopunny) {
+      species = "Buneary + Lopunny";
+      pokedexNo = "427, 428";
+    } else if (hasBuneary) {
+      species = "Buneary";
+      pokedexNo = "427";
+    } else if (hasLopunny) {
+      species = "Lopunny";
+      pokedexNo = "428";
+    } else {
+      species = "Other";
+      pokedexNo = dexNums.join(", ");
+    }
+
+    const variants = getPriceVariants_(card);
+
+    variants.forEach(variant => {
+      const priceMetric = variant === "manual" ? "manual" : "market";
+
+      const priceObj = (((card.tcgplayer || {}).prices || {})[variant] || {});
+      const marketPriceUsd = priceMetric === "manual" ? "" : cleanPrice_(priceObj[priceMetric]);
+
+      const updatedAt = ((card.tcgplayer || {}).updatedAt || "");
+      const tcgplayerUrl = ((card.tcgplayer || {}).url || "");
+      const imageUrl = ((card.images || {}).large || "");
+
+      rows.push([
+        species,
+        pokedexNo,
+        card.id || "",
+        card.name || "",
+        (card.set || {}).id || "",
+        (card.set || {}).name || "",
+        (card.set || {}).series || "",
+        (card.set || {}).releaseDate || "",
+        card.number || "",
+        card.rarity || "",
+        variant,
+        priceMetric,
+        marketPriceUsd,
+        "",
+        "",
+        false,
+        0,
+        "",
+        "",
+        "",
+        "",
+        "",
+        updatedAt,
+        tcgplayerUrl ? `=HYPERLINK("${escapeFormulaString_(tcgplayerUrl)}","TCGplayer")` : "",
+        imageUrl,
+        false,
+        "Medium",
+        "",
+        ""
+      ]);
+    });
+  });
+
+  if (rows.length > 0) {
+    master.getRange(2, 1, rows.length, MASTER_HEADERS.length).setValues(rows);
+    applyLinkFormulas_(master, rows);
+    applyRowFormulas_(master, rows.length);
+  }
+}
+
+/**
+ * Fetches cards by National Pokédex number.
+ */
+function fetchCardsByPokedex_(dexNo) {
+  const allCards = [];
+  let page = 1;
+  const pageSize = 250;
+
+  while (true) {
+    const query = "nationalPokedexNumbers:" + dexNo;
+
+    const url =
+      PTCG_BASE_URL +
+      "/cards?q=" +
+      encodeURIComponent(query) +
+      "&orderBy=set.releaseDate,number" +
+      "&pageSize=" +
+      pageSize +
+      "&page=" +
+      page;
+
+    const json = fetchJson_(url);
+    const data = json.data || [];
+
+    allCards.push(...data);
+
+    if (data.length < pageSize || allCards.length >= (json.totalCount || 0)) {
+      break;
+    }
+
+    page++;
+  }
+
+  return allCards;
+}
+
+/**
+ * Determines which TCGplayer price variants exist for a card.
+ */
+function getPriceVariants_(card) {
+  const prices = (((card || {}).tcgplayer || {}).prices || {});
+  const found = [];
+
+  PRICE_VARIANT_ORDER.forEach(variant => {
+    if (Object.prototype.hasOwnProperty.call(prices, variant)) {
+      found.push(variant);
+    }
+  });
+
+  Object.keys(prices).forEach(variant => {
+    if (!found.includes(variant)) {
+      found.push(variant);
+    }
+  });
+
+  return found.length > 0 ? found : ["manual"];
+}
+
+/**
+ * Refreshes prices using only a few API calls.
+ * This avoids the old 429 throttling problem from fetching every card one by one.
+ */
+function REFRESH_PRICES(showAlert = true) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const master = ss.getSheetByName(SHEET_NAMES.MASTER);
+  const settings = ss.getSheetByName(SHEET_NAMES.SETTINGS);
+
+  if (!master) {
+    throw new Error("Master Tracker sheet not found. Run setup first.");
+  }
+
+  const lastRow = master.getLastRow();
+
+  if (lastRow < 2) {
+    if (showAlert) SpreadsheetApp.getUi().alert("No cards found to refresh.");
+    return;
+  }
+
+  const numRows = lastRow - 1;
+  const values = master.getRange(2, 1, numRows, MASTER_HEADERS.length).getValues();
+
+  const allCards = fetchCardsByPokedex_(427).concat(fetchCardsByPokedex_(428));
+  const cardMap = {};
+
+  allCards.forEach(card => {
+    if (card && card.id) {
+      cardMap[card.id] = card;
+    }
+  });
+
+  const priceValues = [];
+  const updatedValues = [];
+  const linkFormulas = [];
+
+  values.forEach(row => {
+    const cardId = String(row[2] || "").trim();        // Column C
+    const variant = String(row[10] || "").trim();      // Column K
+    const metric = String(row[11] || "market").trim(); // Column L
+
+    const card = cardMap[cardId];
+
+    let price = "";
+    let updatedAt = "";
+    let tcgplayerUrl = "";
+
+    if (metric === "manual") {
+      priceValues.push([row[12] || ""]);
+      updatedValues.push([row[22] || ""]);
+      linkFormulas.push([row[23] || ""]);
+      return;
+    }
+
+    if (card && card.tcgplayer) {
+      updatedAt = card.tcgplayer.updatedAt || "";
+      tcgplayerUrl = card.tcgplayer.url || "";
+
+      const priceObj = (((card.tcgplayer || {}).prices || {})[variant] || {});
+      price = cleanPrice_(priceObj[metric]);
+    }
+
+    priceValues.push([price]);
+    updatedValues.push([updatedAt]);
+
+    if (tcgplayerUrl) {
+      linkFormulas.push([`=HYPERLINK("${escapeFormulaString_(tcgplayerUrl)}","TCGplayer")`]);
+    } else {
+      linkFormulas.push([""]);
+    }
+  });
+
+  master.getRange(2, 13, numRows, 1).setValues(priceValues);    // M
+  master.getRange(2, 23, numRows, 1).setValues(updatedValues);  // W
+  master.getRange(2, 24, numRows, 1).setFormulas(linkFormulas); // X
+
+  if (settings) {
+    settings.getRange("B6").setValue(new Date());
+  }
+
+  if (showAlert) {
+    SpreadsheetApp.getUi().alert("Prices refreshed successfully.");
+  }
+}
+
+/**
+ * Optional custom function:
+ * =PTCG_PRICE("swsh4-25","reverseHolofoil","market")
+ */
+function PTCG_PRICE(cardId, variant, metric) {
+  if (!cardId) return "";
+
+  const card = getPtcgCardById_(String(cardId).trim());
+  const prices = (((card || {}).tcgplayer || {}).prices || {});
+  const selectedVariant = prices[variant || "normal"];
+
+  if (!selectedVariant) return "";
+
+  const value = selectedVariant[metric || "market"];
+  return cleanPrice_(value);
+}
+
+/**
+ * Optional custom function:
+ * =PTCG_UPDATED("swsh4-25")
+ */
+function PTCG_UPDATED(cardId) {
+  if (!cardId) return "";
+
+  const card = getPtcgCardById_(String(cardId).trim());
+  return ((card || {}).tcgplayer || {}).updatedAt || "";
+}
+
+/**
+ * Optional custom function:
+ * =PTCG_URL("swsh4-25")
+ */
+function PTCG_URL(cardId) {
+  if (!cardId) return "";
+
+  const card = getPtcgCardById_(String(cardId).trim());
+  return ((card || {}).tcgplayer || {}).url || "";
+}
+
+/**
+ * Gets one card by ID from cache/API.
+ */
+function getPtcgCardById_(cardId) {
+  const cleanId = String(cardId || "").trim();
+  if (!cleanId) return null;
+
+  const cache = CacheService.getScriptCache();
+  const cacheKey = "ptcg_card_" + cleanId;
+  const cached = cache.get(cacheKey);
+
+  if (cached) {
+    return JSON.parse(cached);
+  }
+
+  const url = PTCG_BASE_URL + "/cards/" + encodeURIComponent(cleanId);
+  const json = fetchJson_(url);
+  const card = json.data || null;
+
+  if (card) {
+    cache.put(cacheKey, JSON.stringify(card), 21600); // 6 hours
+  }
+
+  return card;
+}
+
+/**
+ * Fetches JSON with retry handling for 429 throttling.
+ */
+function fetchJson_(url) {
+  const options = {
+    method: "get",
+    muteHttpExceptions: true,
+    headers: {}
+  };
+
+  const apiKey = getApiKey_();
+
+  if (apiKey) {
+    options.headers["X-Api-Key"] = apiKey;
+  }
+
+  const maxAttempts = 4;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const response = UrlFetchApp.fetch(url, options);
+    const code = response.getResponseCode();
+    const text = response.getContentText();
+
+    if (code >= 200 && code < 300) {
+      return JSON.parse(text);
+    }
+
+    if (code === 429 && attempt < maxAttempts) {
+      Utilities.sleep(65000);
+      continue;
+    }
+
+    throw new Error("Pokémon TCG API error " + code + ": " + text);
+  }
+
+  throw new Error("Failed to fetch API data.");
+}
+
+/**
+ * Reads optional API key from Settings!B4.
+ */
+function getApiKey_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const settings = ss.getSheetByName(SHEET_NAMES.SETTINGS);
+
+  if (!settings) return "";
+
+  return String(settings.getRange("B4").getValue() || "").trim();
+}
+
+/**
+ * Clears cached card data.
+ */
+function CLEAR_PTCG_CACHE() {
+  const cache = CacheService.getScriptCache();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const master = ss.getSheetByName(SHEET_NAMES.MASTER);
+
+  if (!master || master.getLastRow() < 2) {
+    SpreadsheetApp.getUi().alert("No card cache to clear.");
+    return;
+  }
+
+  const ids = master
+    .getRange(2, 3, master.getLastRow() - 1, 1)
+    .getValues()
+    .flat()
+    .map(id => String(id || "").trim())
+    .filter(id => id !== "");
+
+  const keys = Array.from(new Set(ids)).map(id => "ptcg_card_" + id);
+
+  if (keys.length > 0) {
+    cache.removeAll(keys);
+  }
+
+  SpreadsheetApp.getUi().alert("API cache cleared.");
+}
+
+/**
+ * Creates or clears a sheet.
+ */
+function resetSheet_(ss, name) {
+  let sheet = ss.getSheetByName(name);
+
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+  }
+
+  const filter = sheet.getFilter();
+  if (filter) filter.remove();
+
+  sheet.clear();
+  sheet.clearConditionalFormatRules();
+
+  return sheet;
+}
+
+/**
+ * Builds Settings sheet.
+ */
+function buildSettings_(sheet) {
+  const rows = [
+    ["Setting", "Value", "Notes"],
+    ["USD to AUD FX rate", 1.52, "Update manually when you want AUD values refreshed."],
+    ["Default price metric", "market", "Recommended: market."],
+    ["Pokémon TCG API key", "", "Optional but recommended if you refresh often."],
+    ["Last full import", "", "Updated when setup/re-import is run."],
+    ["Last price refresh", "", "Updated when prices are refreshed."],
+    ["", "", ""],
+    ["Serebii Buneary checklist", "https://www.serebii.net/card/dex/427.shtml", "Use this to manually cross-check completeness."],
+    ["Serebii Lopunny checklist", "https://www.serebii.net/card/dex/428.shtml", "Use this to manually cross-check completeness."]
+  ];
+
+  sheet.getRange(1, 1, rows.length, 3).setValues(rows);
+
+  sheet.getRange("A1:C1").setFontWeight("bold").setBackground("#eeeeee");
+  sheet.setColumnWidth(1, 220);
+  sheet.setColumnWidth(2, 460);
+  sheet.setColumnWidth(3, 520);
+
+  sheet.getRange("B2").setNumberFormat("0.0000");
+  sheet.getRange("B5:B6").setNumberFormat("dd/mm/yyyy hh:mm");
+}
+
+/**
+ * Builds Master Tracker sheet.
+ */
+function buildMaster_(sheet) {
+  sheet.getRange(1, 1, 1, MASTER_HEADERS.length).setValues([MASTER_HEADERS]);
+
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, MASTER_HEADERS.length)
+    .setFontWeight("bold")
+    .setBackground("#eeeeee");
+
+  const widths = [
+    150, 110, 130, 220, 100, 220, 160, 110, 90, 160,
+    150, 120, 130, 110, 130, 90, 90, 110, 140, 130,
+    140, 130, 140, 130, 320, 130, 140, 160, 260
+  ];
+
+  widths.forEach((width, i) => {
+    sheet.setColumnWidth(i + 1, width);
+  });
+}
+
+/**
+ * Applies row formulas.
+ */
+function applyRowFormulas_(sheet, numRows) {
+  if (numRows <= 0) return;
+
+  const fxFormulas = [];
+  const audPriceFormulas = [];
+  const totalCostFormulas = [];
+  const marketValueFormulas = [];
+  const gainLossFormulas = [];
+
+  for (let i = 0; i < numRows; i++) {
+    const r = i + 2;
+
+    fxFormulas.push([`=Settings!$B$2`]);
+    audPriceFormulas.push([`=IFERROR($M${r}*$N${r},"")`]);
+    totalCostFormulas.push([`=IFERROR($Q${r}*$S${r},0)`]);
+    marketValueFormulas.push([`=IFERROR($Q${r}*$O${r},0)`]);
+    gainLossFormulas.push([`=IFERROR($U${r}-$T${r},0)`]);
+  }
+
+  sheet.getRange(2, 14, numRows, 1).setFormulas(fxFormulas);          // N
+  sheet.getRange(2, 15, numRows, 1).setFormulas(audPriceFormulas);    // O
+  sheet.getRange(2, 20, numRows, 1).setFormulas(totalCostFormulas);   // T
+  sheet.getRange(2, 21, numRows, 1).setFormulas(marketValueFormulas); // U
+  sheet.getRange(2, 22, numRows, 1).setFormulas(gainLossFormulas);    // V
+}
+
+/**
+ * Re-applies hyperlink formulas to TCGplayer column after setValues.
+ */
+function applyLinkFormulas_(sheet, rows) {
+  const formulas = rows.map(row => {
+    const value = row[23];
+
+    if (typeof value === "string" && value.startsWith("=HYPERLINK")) {
+      return [value];
+    }
+
+    return [""];
+  });
+
+  if (formulas.length > 0) {
+    sheet.getRange(2, 24, formulas.length, 1).setFormulas(formulas);
+  }
+}
+
+/**
+ * Formatting.
+ */
+function applyMasterFormatting_(sheet) {
+  const lastRow = Math.max(sheet.getLastRow(), 2);
+
+  sheet.getRange(2, 13, lastRow - 1, 3).setNumberFormat("$#,##0.00"); // M:O
+  sheet.getRange(2, 19, lastRow - 1, 4).setNumberFormat("$#,##0.00"); // S:V
+  sheet.getRange(2, 14, lastRow - 1, 1).setNumberFormat("0.0000");    // N
+  sheet.getRange(2, 23, lastRow - 1, 1).setNumberFormat("yyyy/mm/dd");
+
+  if (lastRow > 1 && !sheet.getFilter()) {
+    sheet.getRange(1, 1, lastRow, MASTER_HEADERS.length).createFilter();
+  }
+
+  const rules = [];
+
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied("=$P2=TRUE")
+      .setBackground("#d9ead3")
+      .setRanges([sheet.getRange(2, 1, lastRow - 1, MASTER_HEADERS.length)])
+      .build()
+  );
+
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied("=$P2=FALSE")
+      .setBackground("#fce5cd")
+      .setRanges([sheet.getRange(2, 1, lastRow - 1, MASTER_HEADERS.length)])
+      .build()
+  );
+
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(0)
+      .setBackground("#d9ead3")
+      .setRanges([sheet.getRange(2, 22, lastRow - 1, 1)])
+      .build()
+  );
+
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberLessThan(0)
+      .setBackground("#f4cccc")
+      .setRanges([sheet.getRange(2, 22, lastRow - 1, 1)])
+      .build()
+  );
+
+  sheet.setConditionalFormatRules(rules);
+}
+
+/**
+ * Dropdowns and checkboxes.
+ */
+function applyMasterValidations_(sheet) {
+  const maxRows = sheet.getMaxRows();
+  const editableRows = maxRows - 1;
+
+  if (editableRows <= 0) return;
+
+  const variantRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(PRICE_VARIANT_ORDER.concat(["manual"]), true)
+    .setAllowInvalid(true)
+    .build();
+
+  const metricRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(PRICE_METRICS, true)
+    .setAllowInvalid(true)
+    .build();
+
+  const conditionRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(["NM", "LP", "MP", "HP", "DM", "Graded", "Sealed", "Unknown"], true)
+    .setAllowInvalid(true)
+    .build();
+
+  const priorityRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(["Low", "Medium", "High", "Chase"], true)
+    .setAllowInvalid(true)
+    .build();
+
+  sheet.getRange(2, 11, editableRows, 1).setDataValidation(variantRule);   // K
+  sheet.getRange(2, 12, editableRows, 1).setDataValidation(metricRule);    // L
+  sheet.getRange(2, 18, editableRows, 1).setDataValidation(conditionRule); // R
+  sheet.getRange(2, 27, editableRows, 1).setDataValidation(priorityRule);  // AA
+
+  sheet.getRange(2, 16, editableRows, 1).insertCheckboxes(); // P
+  sheet.getRange(2, 26, editableRows, 1).insertCheckboxes(); // Z
+}
+
+/**
+ * Dashboard.
+ */
+function buildDashboard_(sheet) {
+  sheet.getRange("A1").setValue("Buneary + Lopunny Collection Dashboard");
+  sheet.getRange("A1").setFontWeight("bold").setFontSize(16);
+
+  const metrics = [
+    ["Metric", "Value"],
+    ["Total card/variant rows", ""],
+    ["Owned rows", ""],
+    ["Completion %", ""],
+    ["Missing rows", ""],
+    ["Total market value AUD", ""],
+    ["Total purchase cost AUD", ""],
+    ["Gain/Loss AUD", ""],
+    ["Buneary rows owned", ""],
+    ["Lopunny rows owned", ""]
+  ];
+
+  sheet.getRange(3, 1, metrics.length, 2).setValues(metrics);
+  sheet.getRange("A3:B3").setFontWeight("bold").setBackground("#eeeeee");
+
+  sheet.getRange("B4").setFormula(`=COUNTA('${SHEET_NAMES.MASTER}'!C2:C)`);
+  sheet.getRange("B5").setFormula(`=COUNTIF('${SHEET_NAMES.MASTER}'!P2:P,TRUE)`);
+  sheet.getRange("B6").setFormula(`=IFERROR(B5/B4,0)`);
+  sheet.getRange("B7").setFormula(`=B4-B5`);
+  sheet.getRange("B8").setFormula(`=SUM('${SHEET_NAMES.MASTER}'!U2:U)`);
+  sheet.getRange("B9").setFormula(`=SUM('${SHEET_NAMES.MASTER}'!T2:T)`);
+  sheet.getRange("B10").setFormula(`=SUM('${SHEET_NAMES.MASTER}'!V2:V)`);
+  sheet.getRange("B11").setFormula(`=COUNTIFS('${SHEET_NAMES.MASTER}'!A2:A,"*Buneary*", '${SHEET_NAMES.MASTER}'!P2:P, TRUE)`);
+  sheet.getRange("B12").setFormula(`=COUNTIFS('${SHEET_NAMES.MASTER}'!A2:A,"*Lopunny*", '${SHEET_NAMES.MASTER}'!P2:P, TRUE)`);
+
+  sheet.getRange("B6").setNumberFormat("0.00%");
+  sheet.getRange("B8:B10").setNumberFormat("$#,##0.00");
+
+  sheet.getRange("D3:I3").setValues([[
+    "Species",
+    "Card Name",
+    "Set Name",
+    "Card No.",
+    "Variant",
+    "Price AUD"
+  ]]);
+
+  sheet.getRange("D3:I3").setFontWeight("bold").setBackground("#eeeeee");
+
+  sheet.getRange("D4").setFormula(
+    `=IFERROR(FILTER({'${SHEET_NAMES.MASTER}'!A2:A,'${SHEET_NAMES.MASTER}'!D2:D,'${SHEET_NAMES.MASTER}'!F2:F,'${SHEET_NAMES.MASTER}'!I2:I,'${SHEET_NAMES.MASTER}'!K2:K,'${SHEET_NAMES.MASTER}'!O2:O},'${SHEET_NAMES.MASTER}'!P2:P=FALSE),"None missing")`
+  );
+
+  sheet.setColumnWidth(1, 240);
+  sheet.setColumnWidth(2, 160);
+  sheet.setColumnWidth(4, 160);
+  sheet.setColumnWidth(5, 220);
+  sheet.setColumnWidth(6, 220);
+  sheet.setColumnWidth(7, 100);
+  sheet.setColumnWidth(8, 160);
+  sheet.setColumnWidth(9, 120);
+}
+
+/**
+ * Read Me.
+ */
+function buildReadMe_(sheet) {
+  const rows = [
+    ["How to use this tracker"],
+    [""],
+    ["1. Run SETUP_BUNEARY_LOPUNNY_TRACKER once from Apps Script."],
+    ["2. Authorise the script when Google asks."],
+    ["3. Use the Master Tracker sheet to tick Owned?, enter Qty Owned, Condition, Purchase Price, and Binder Location."],
+    ["4. To refresh prices, use Pokémon Tracker → Refresh prices now."],
+    ["5. Update USD/AUD FX in Settings!B2 whenever you want AUD values recalculated."],
+    ["6. Use the Serebii Checked? column to manually cross-check against the Buneary and Lopunny Serebii pages."],
+    ["7. If Serebii lists a Japanese-only, promo, stamped, or unusual variant not returned by the API, add it manually at the bottom of Master Tracker and set Variant/Price Metric to manual."],
+    [""],
+    ["Important notes"],
+    ["The Pokémon TCG API TCGplayer data is in USD. AUD values are converted using your Settings sheet FX rate."],
+    ["Some older, Japanese-exclusive, staff, stamped, sealed, or niche variants may need manual review."],
+    ["For performance, the main Refresh Prices function writes API-pulled values into the tracker rather than forcing every cell to call the API constantly."]
+  ];
+
+  sheet.getRange(1, 1, rows.length, 1).setValues(rows);
+  sheet.getRange("A1").setFontWeight("bold").setFontSize(16);
+  sheet.setColumnWidth(1, 1000);
+  sheet.getRange("A1:A" + rows.length).setWrap(true);
+}
+
+/**
+ * Helpers.
+ */
+function cleanPrice_(value) {
+  if (value === undefined || value === null || value === "") return "";
+  const number = Number(value);
+  return isNaN(number) ? "" : number;
+}
+
+function escapeFormulaString_(value) {
+  return String(value || "").replace(/"/g, '""');
+}
